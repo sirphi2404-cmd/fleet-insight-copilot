@@ -13,8 +13,8 @@ from src.llm import generate_insights, chat_answer
 load_dotenv()
 
 st.set_page_config(page_title="Fleet Safety Insight Copilot", layout="wide")
-st.title("Fleet Safety Insight Copilot (Local V1)")
-st.caption("Upload a safety report (CSV/XLSX) → get insights + charts → chat follow-ups (grounded).")
+st.title("Fleet Safety Insight Copilot (Driver Scores Report)")
+st.caption("Upload the driver scores report (CSV/XLSX) → get insights + charts → chat follow-ups (grounded).")
 
 
 # ---------- Helpers (define BEFORE use) ----------
@@ -82,6 +82,11 @@ def resolve_field(df: pd.DataFrame, field) -> str | None:
 def choose_chart_df(facts_pack: dict, chart_spec: dict) -> pd.DataFrame | None:
     """
     Select the best chart dataset depending on chart needs.
+    Supports:
+      - array-based x/y from LLM (builds its own DF)
+      - exposure scatter dataset
+      - pareto curve dataset
+      - top risky dataset
     """
     chart_data = facts_pack.get("chart_data", {})
 
@@ -89,9 +94,6 @@ def choose_chart_df(facts_pack: dict, chart_spec: dict) -> pd.DataFrame | None:
     y_raw = chart_spec.get("y")
     title = str(chart_spec.get("title", "")).lower()
     ctype = str(chart_spec.get("type", "")).lower()
-
-    x_l = _clean_field_name(str(x_raw)).lower() if x_raw is not None else ""
-    y_l = _clean_field_name(str(y_raw)).lower() if y_raw is not None else ""
 
     # If LLM returns literal arrays for x/y, no need to choose a dataset
     if isinstance(x_raw, list) and isinstance(y_raw, list):
@@ -104,7 +106,7 @@ def choose_chart_df(facts_pack: dict, chart_spec: dict) -> pd.DataFrame | None:
             return json_normalize_safe(rows)
 
     # Pareto curve -> pareto_curve_total_events (rank vs cumulative_share)
-    if ("pareto" in title) or ("cumulative" in x_l or "rank" in x_l or "cumulative" in y_l):
+    if ("pareto" in title):
         rows = chart_data.get("pareto_curve_total_events", [])
         if rows:
             return json_normalize_safe(rows)
@@ -159,22 +161,20 @@ def render_chart(df: pd.DataFrame, chart_spec: dict):
     y_raw = chart_spec.get("y")
     title = chart_spec.get("title", "Chart")
 
-    # 🟢 Case 1: LLM returned literal arrays in x/y
-    if isinstance(x_raw, list) and isinstance(y_raw, list):
-        if len(x_raw) != len(y_raw) or len(x_raw) == 0:
-            st.info(f"Chart skipped (array length mismatch): {title}")
+    # 🟢 Case 1: LLM returned literal arrays in x/y (already normalized in choose_chart_df)
+    if "x" in df.columns and "y" in df.columns and isinstance(x_raw, list) and isinstance(y_raw, list):
+        if len(df) == 0:
+            st.info(f"Chart skipped (empty data): {title}")
             return
 
-        temp_df = pd.DataFrame({"x": x_raw, "y": y_raw})
-
         if ctype in ["bar", "stacked_bar", ""]:
-            fig = px.bar(temp_df, x="x", y="y", title=title)
+            fig = px.bar(df, x="x", y="y", title=title)
         elif ctype == "line":
-            fig = px.line(temp_df, x="x", y="y", title=title)
+            fig = px.line(df, x="x", y="y", title=title)
         elif ctype == "scatter":
-            fig = px.scatter(temp_df, x="x", y="y", title=title)
+            fig = px.scatter(df, x="x", y="y", title=title)
         else:
-            fig = px.bar(temp_df, x="x", y="y", title=title)
+            fig = px.bar(df, x="x", y="y", title=title)
 
         st.plotly_chart(fig, use_container_width=True)
         return
@@ -189,6 +189,14 @@ def render_chart(df: pd.DataFrame, chart_spec: dict):
         x = x or ix
         y = y or iy
 
+    if ctype == "histogram":
+        if x is None:
+            st.info(f"Chart skipped (missing x): {title}")
+            return
+        fig = px.histogram(df, x=x, title=title)
+        st.plotly_chart(fig, use_container_width=True)
+        return
+
     if x is None or y is None:
         st.info(f"Chart skipped (missing columns): {title} | x={x}, y={y}")
         return
@@ -199,12 +207,81 @@ def render_chart(df: pd.DataFrame, chart_spec: dict):
         fig = px.line(df, x=x, y=y, title=title)
     elif ctype == "scatter":
         fig = px.scatter(df, x=x, y=y, title=title)
-    elif ctype == "histogram":
-        fig = px.histogram(df, x=x, title=title)
     else:
         fig = px.bar(df, x=x, y=y, title=title)
 
     st.plotly_chart(fig, use_container_width=True)
+
+def render_deterministic_insights(facts_pack: dict):
+    prof = facts_pack.get("dataset_profile", {})
+    dist = facts_pack.get("distribution", {})
+    rels = facts_pack.get("relationships", [])
+    pareto = facts_pack.get("pareto", [])
+    chart_data = facts_pack.get("chart_data", {})
+
+    st.subheader("Insights snapshot (data-derived)")
+
+    # Dataset size
+    st.write(f"• Rows (drivers): **{prof.get('rows', '—')}** | Columns: **{prof.get('columns', '—')}**")
+
+    # Primary score distribution
+    ps = dist.get("primary_score")
+    if isinstance(ps, dict):
+        st.write(
+            f"• Safety Score distribution — "
+            f"min **{ps.get('min')}**, p10 **{ps.get('p10')}**, median **{ps.get('median')}**, "
+            f"p90 **{ps.get('p90')}**, max **{ps.get('max')}**"
+        )
+
+    # Total events distribution
+    te = dist.get("total_events")
+    if isinstance(te, dict):
+        st.write(
+            f"• Total events distribution — "
+            f"min **{te.get('min')}**, p90 **{te.get('p90')}**, max **{te.get('max')}**"
+        )
+
+    # Relationship summary
+    if rels and isinstance(rels, list):
+        r0 = rels[0]
+        if isinstance(r0, dict):
+            st.write(
+                f"• Relationship — **{r0.get('x')} vs {r0.get('y')}**: "
+                f"{r0.get('method')} r = **{r0.get('value')}**"
+            )
+
+    # Pareto summary for total_events
+    p_total = None
+    for p in pareto:
+        if isinstance(p, dict) and p.get("metric") == "total_events":
+            p_total = p
+            break
+    if p_total:
+        st.write(
+            f"• Event concentration (Pareto) — Top 20% drivers contribute **{p_total.get('top_20pct_contribution')}** "
+            f"of total events; Top 10 drivers contribute **{p_total.get('top_10_entities_contribution')}**"
+        )
+
+    # Watch-outs: low exposure inflation from top risky entities
+    top_risky = chart_data.get("top_risky_entities", [])
+    if top_risky:
+        low_exposure = []
+        for r in top_risky:
+            if not isinstance(r, dict):
+                continue
+            dist_travel = r.get("Distance Travelled")
+            rate = r.get("events_per_100_exposure")
+            if dist_travel is not None and rate is not None:
+                try:
+                    if float(dist_travel) <= 15 and float(rate) >= 20:
+                        low_exposure.append((r.get("entity"), dist_travel, rate))
+                except Exception:
+                    pass
+
+        if low_exposure:
+            st.write("• Watch-outs (low exposure can inflate normalized rates):")
+            for name, d, rate in low_exposure[:5]:
+                st.write(f"  - {name}: Distance **{d}**, Rate **{rate}** per 100 exposure")
 
 
 # ---------- App state ----------
@@ -271,6 +348,9 @@ if uploaded:
             st.subheader("Executive summary")
             for b in insights.get("executive_summary", []):
                 st.write("• " + str(b))
+
+            # ✅ Always show more text derived from data (even if LLM is brief)
+            render_deterministic_insights(st.session_state.facts_pack)
 
             st.subheader("Key findings")
             for f in insights.get("key_findings", []):
