@@ -1,7 +1,8 @@
-# src/llm.py
 from __future__ import annotations
 import os
+import json
 from typing import Dict, Any, List
+
 from openai import OpenAI
 
 from .schemas import INSIGHTS_JSON_SCHEMA
@@ -12,33 +13,44 @@ def get_client() -> OpenAI:
 
 
 def generate_insights(facts_pack: Dict[str, Any], user_question: str | None = None) -> Dict[str, Any]:
-    """
-    Uses GPT-5.2 to turn computed facts into: insights + recommended actions + chart specs.
-    Grounded: The model is instructed to ONLY use facts_pack.
-    """
     model = os.getenv("OPENAI_MODEL", "gpt-5.2")
     client = get_client()
-
     prompt = _build_prompt(facts_pack=facts_pack, user_question=user_question)
 
-    resp = client.responses.create(
-        model=model,
-        input=prompt,
-        text={
-            "format": {
-                "type": "json_schema",
-                "name": INSIGHTS_JSON_SCHEMA["name"],
-                "schema": INSIGHTS_JSON_SCHEMA["schema"],
-                "strict": True,
-            }
-        },
-        temperature=0.2,
-    )
-
-    # The SDK returns structured text output; easiest is resp.output_text
-    # but with structured outputs you can parse as JSON from output_text safely.
-    import json
-    return json.loads(resp.output_text)
+    # 1) Try Responses API (newer SDK)
+    try:
+        resp = client.responses.create(
+            model=model,
+            input=prompt,
+            text={
+                "format": {
+                    "type": "json_schema",
+                    "name": INSIGHTS_JSON_SCHEMA["name"],
+                    "schema": INSIGHTS_JSON_SCHEMA["schema"],
+                    "strict": True,
+                }
+            },
+            temperature=0.2,
+        )
+        return json.loads(resp.output_text)
+    except Exception:
+        # 2) Fallback: Chat Completions (more widely supported)
+        resp = client.chat.completions.create(
+            model=model,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "Return ONLY valid JSON that matches the required schema. "
+                        "No markdown. No extra text."
+                    ),
+                },
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.2,
+        )
+        content = resp.choices[0].message.content.strip()
+        return json.loads(content)
 
 
 def chat_answer(
@@ -46,10 +58,6 @@ def chat_answer(
     chat_history: List[Dict[str, str]],
     user_message: str,
 ) -> str:
-    """
-    Lightweight chat: answers using only facts_pack and prior messages.
-    (V1: we keep it text-only in chat; charts come from the main insights call.)
-    """
     model = os.getenv("OPENAI_MODEL", "gpt-5.2")
     client = get_client()
 
@@ -60,7 +68,6 @@ def chat_answer(
         "Do not invent numbers."
     )
 
-    # Build conversation input
     convo = [{"role": "system", "content": system_rules}]
     convo.append({"role": "user", "content": "facts_pack:\n" + _safe_truncate_json(facts_pack, max_chars=14000)})
 
@@ -69,12 +76,13 @@ def chat_answer(
 
     convo.append({"role": "user", "content": user_message})
 
-    resp = client.responses.create(
-        model=model,
-        input=convo,
-        temperature=0.2,
-    )
-    return resp.output_text
+    # Try responses, fallback to chat completions
+    try:
+        resp = client.responses.create(model=model, input=convo, temperature=0.2)
+        return resp.output_text
+    except Exception:
+        resp = client.chat.completions.create(model=model, messages=convo, temperature=0.2)
+        return resp.choices[0].message.content
 
 
 def _build_prompt(facts_pack: Dict[str, Any], user_question: str | None) -> str:
@@ -90,15 +98,11 @@ def _build_prompt(facts_pack: Dict[str, Any], user_question: str | None) -> str:
     )
     if user_question:
         base += f"User focus question: {user_question}\n\n"
-
     base += "facts_pack:\n"
     base += _safe_truncate_json(facts_pack, max_chars=25000)
     return base
 
 
 def _safe_truncate_json(obj: Dict[str, Any], max_chars: int) -> str:
-    import json
     s = json.dumps(obj, ensure_ascii=False)
-    if len(s) <= max_chars:
-        return s
-    return s[:max_chars] + "...(truncated)"
+    return s if len(s) <= max_chars else s[:max_chars] + "...(truncated)"
