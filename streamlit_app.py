@@ -80,23 +80,23 @@ def choose_chart_df(facts_pack: dict, chart_spec: dict) -> pd.DataFrame | None:
     """
     chart_data = facts_pack.get("chart_data", {})
 
-    # If chart needs Distance Travelled vs total_events, use exposure_vs_events
     x_raw = chart_spec.get("x", "")
     y_raw = chart_spec.get("y", "")
 
     x_l = _clean_field_name(str(x_raw)).lower()
     y_l = _clean_field_name(str(y_raw)).lower()
 
+    # Distance vs events scatter -> exposure_vs_events
     if ("distance" in x_l or "miles" in x_l or "travelled" in x_l) and ("total_events" in y_l or "total events" in y_l):
         rows = chart_data.get("exposure_vs_events", [])
         return json_normalize_safe(rows) if rows else None
 
-    # Pareto chart: if it asks for rank/cumulative share, use pareto curve
-    if "pareto" in str(chart_spec.get("type", "")).lower() or ("cumulative" in x_l or "rank" in x_l or "cumulative" in y_l):
+    # Pareto curve -> pareto_curve_total_events (rank vs cumulative_share)
+    if ("pareto" in str(chart_spec.get("type", "")).lower()) or ("cumulative" in x_l or "rank" in x_l or "cumulative" in y_l):
         rows = chart_data.get("pareto_curve_total_events", [])
         return json_normalize_safe(rows) if rows else None
 
-    # Default: top risky entities
+    # Default -> top risky entities
     rows = chart_data.get("top_risky_entities", [])
     return json_normalize_safe(rows) if rows else None
 
@@ -146,7 +146,7 @@ def render_chart(df: pd.DataFrame, chart_spec: dict):
 # ---------- App state ----------
 
 if not os.getenv("OPENAI_API_KEY"):
-    st.warning("OPENAI_API_KEY not found. Add it to .env and restart Streamlit.")
+    st.warning("OPENAI_API_KEY not found. Add it in Streamlit Secrets (Cloud) or .env (local).")
 
 uploaded = st.file_uploader("Upload report (CSV/XLSX)", type=["csv", "xlsx"])
 
@@ -206,42 +206,58 @@ if uploaded:
         with left:
             st.subheader("Executive summary")
             for b in insights.get("executive_summary", []):
-                st.write("• " + b)
+                st.write("• " + str(b))
 
             st.subheader("Key findings")
             for f in insights.get("key_findings", []):
-                st.markdown(f"**{f.get('title','')}**")
-                st.write(f.get("what_it_means",""))
-                st.caption("Evidence:")
-                for e in f.get("evidence", []):
-                    st.write(f"- {e.get('metric')}: **{e.get('value')}** ({e.get('slice')})")
-                st.write("")
+                if isinstance(f, dict):
+                    st.markdown(f"**{f.get('title','')}**")
+                    st.write(f.get("what_it_means",""))
+                    st.caption("Evidence:")
+                    for e in f.get("evidence", []):
+                        if isinstance(e, dict):
+                            st.write(f"- {e.get('metric')}: **{e.get('value')}** ({e.get('slice')})")
+                        else:
+                            st.write(f"- {e}")
+                    st.write("")
+                else:
+                    st.write(f)
 
             st.subheader("Recommended actions")
             for a in insights.get("recommended_actions", []):
-                st.markdown(f"**{a.get('priority')} — {a.get('action')}**")
-                st.write(f"Owner: {a.get('who')}")
-                st.write(f"Expected: {a.get('expected_outcome')}")
-                st.caption(a.get("why",""))
-                st.write("")
+                if isinstance(a, dict):
+                    st.markdown(f"**{a.get('priority','')} — {a.get('action','')}**")
+                    st.write(f"Owner: {a.get('who','')}")
+                    st.write(f"Expected: {a.get('expected_outcome','')}")
+                    st.caption(a.get("why",""))
+                    st.write("")
+                else:
+                    st.write(a)
 
             dq = insights.get("data_quality_notes", [])
             if dq:
                 st.subheader("Data quality notes")
                 for d in dq:
-                    st.markdown(
-                        f"- **Issue:** {d.get('issue')}  \n"
-                        f"  Impact: {d.get('impact')}  \n"
-                        f"  Fix: {d.get('suggested_fix')}"
-                    )
+                    if isinstance(d, dict):
+                        st.markdown(
+                            f"- **Issue:** {d.get('issue')}  \n"
+                            f"  Impact: {d.get('impact')}  \n"
+                            f"  Fix: {d.get('suggested_fix')}"
+                        )
+                    else:
+                        st.markdown(f"- {d}")
 
         with right:
             st.subheader("Charts")
             st.caption("Charts automatically pick the right dataset (top risky / exposure scatter / pareto curve).")
 
             for ch in insights.get("charts", []):
-                if ch.get("notes"):
+                if isinstance(ch, dict) and ch.get("notes"):
                     st.caption(ch["notes"])
+
+                if not isinstance(ch, dict):
+                    st.info(f"Skipping invalid chart spec: {ch}")
+                    continue
 
                 chart_df = choose_chart_df(st.session_state.facts_pack, ch)
                 if chart_df is None or chart_df.empty:
@@ -252,7 +268,7 @@ if uploaded:
 
             st.subheader("Suggested follow-ups")
             for q in insights.get("follow_up_questions", []):
-                st.write("• " + q)
+                st.write("• " + str(q))
 
     st.divider()
 
