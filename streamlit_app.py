@@ -32,18 +32,22 @@ def _clean_field_name(s: str) -> str:
     s = re.sub(r"\s+", " ", s)
     return s
 
-def resolve_field(df: pd.DataFrame, field: str) -> str | None:
+def resolve_field(df: pd.DataFrame, field) -> str | None:
+    if field is None:
+        return None
     if not isinstance(field, str):
         return None
 
     raw = field.strip()
     cleaned = _clean_field_name(raw)
 
+    # direct matches
     if raw in df.columns:
         return raw
     if cleaned in df.columns:
         return cleaned
 
+    # common aliases
     aliases = {
         "driver": "entity",
         "driver name": "entity",
@@ -66,6 +70,7 @@ def resolve_field(df: pd.DataFrame, field: str) -> str | None:
     if key in aliases and aliases[key] in df.columns:
         return aliases[key]
 
+    # case-insensitive match
     lower_map = {c.lower(): c for c in df.columns}
     if cleaned.lower() in lower_map:
         return lower_map[cleaned.lower()]
@@ -80,65 +85,124 @@ def choose_chart_df(facts_pack: dict, chart_spec: dict) -> pd.DataFrame | None:
     """
     chart_data = facts_pack.get("chart_data", {})
 
-    x_raw = chart_spec.get("x", "")
-    y_raw = chart_spec.get("y", "")
+    x_raw = chart_spec.get("x")
+    y_raw = chart_spec.get("y")
+    title = str(chart_spec.get("title", "")).lower()
+    ctype = str(chart_spec.get("type", "")).lower()
 
-    x_l = _clean_field_name(str(x_raw)).lower()
-    y_l = _clean_field_name(str(y_raw)).lower()
+    x_l = _clean_field_name(str(x_raw)).lower() if x_raw is not None else ""
+    y_l = _clean_field_name(str(y_raw)).lower() if y_raw is not None else ""
+
+    # If LLM returns literal arrays for x/y, no need to choose a dataset
+    if isinstance(x_raw, list) and isinstance(y_raw, list):
+        return pd.DataFrame({"x": x_raw, "y": y_raw})
 
     # Distance vs events scatter -> exposure_vs_events
-    if ("distance" in x_l or "miles" in x_l or "travelled" in x_l) and ("total_events" in y_l or "total events" in y_l):
+    if ("exposure" in title or "distance" in title or "miles" in title or "travelled" in title or ctype == "scatter"):
         rows = chart_data.get("exposure_vs_events", [])
-        return json_normalize_safe(rows) if rows else None
+        if rows:
+            return json_normalize_safe(rows)
 
     # Pareto curve -> pareto_curve_total_events (rank vs cumulative_share)
-    if ("pareto" in str(chart_spec.get("type", "")).lower()) or ("cumulative" in x_l or "rank" in x_l or "cumulative" in y_l):
+    if ("pareto" in title) or ("cumulative" in x_l or "rank" in x_l or "cumulative" in y_l):
         rows = chart_data.get("pareto_curve_total_events", [])
-        return json_normalize_safe(rows) if rows else None
+        if rows:
+            return json_normalize_safe(rows)
 
     # Default -> top risky entities
     rows = chart_data.get("top_risky_entities", [])
     return json_normalize_safe(rows) if rows else None
 
+def infer_xy_from_title(df: pd.DataFrame, chart_spec: dict) -> tuple[str | None, str | None]:
+    """
+    If the model doesn't provide x/y (or provides unusable values), infer from title + available columns.
+    """
+    title = str(chart_spec.get("title", "")).lower()
+    ctype = str(chart_spec.get("type", "")).lower()
+
+    # Pareto curve inference
+    if "pareto" in title or ("rank" in df.columns and "cumulative_share" in df.columns):
+        x = "rank" if "rank" in df.columns else None
+        y = "cumulative_share" if "cumulative_share" in df.columns else None
+        return x, y
+
+    # Exposure scatter inference
+    if "exposure" in title or "distance" in title or ctype == "scatter":
+        if "Distance Travelled" in df.columns and "total_events" in df.columns:
+            return "Distance Travelled", "total_events"
+
+    # Bar charts on risky entities
+    if "entity" in df.columns:
+        if ("per 100" in title or "normalized" in title or "rate" in title) and "events_per_100_exposure" in df.columns:
+            return "entity", "events_per_100_exposure"
+        if ("total events" in title or "volume" in title) and "total_events" in df.columns:
+            return "entity", "total_events"
+        if ("safety" in title or "score" in title) and "primary_score" in df.columns:
+            return "entity", "primary_score"
+
+    # Fallback: first text-like as x, first numeric as y
+    x = None
+    y = None
+    for c in df.columns:
+        if df[c].dtype == object:
+            x = c
+            break
+    for c in df.columns:
+        if pd.api.types.is_numeric_dtype(df[c]):
+            y = c
+            break
+    return x, y
+
 def render_chart(df: pd.DataFrame, chart_spec: dict):
-    ctype = chart_spec.get("type")
+    ctype = str(chart_spec.get("type", "")).lower()
     x_raw = chart_spec.get("x")
     y_raw = chart_spec.get("y")
     title = chart_spec.get("title", "Chart")
 
-    x = resolve_field(df, x_raw) if x_raw else None
-    y = resolve_field(df, y_raw) if y_raw else None
-
-    if ctype == "histogram":
-        if x is None:
-            st.info(f"Chart skipped (missing x): {title} | x={x_raw}")
+    # 🟢 Case 1: LLM returned literal arrays in x/y
+    if isinstance(x_raw, list) and isinstance(y_raw, list):
+        if len(x_raw) != len(y_raw) or len(x_raw) == 0:
+            st.info(f"Chart skipped (array length mismatch): {title}")
             return
-        fig = px.histogram(df, x=x, title=title)
+
+        temp_df = pd.DataFrame({"x": x_raw, "y": y_raw})
+
+        if ctype in ["bar", "stacked_bar", ""]:
+            fig = px.bar(temp_df, x="x", y="y", title=title)
+        elif ctype == "line":
+            fig = px.line(temp_df, x="x", y="y", title=title)
+        elif ctype == "scatter":
+            fig = px.scatter(temp_df, x="x", y="y", title=title)
+        else:
+            fig = px.bar(temp_df, x="x", y="y", title=title)
+
         st.plotly_chart(fig, use_container_width=True)
         return
 
+    # 🟢 Case 2: Column-based charts (normal)
+    x = resolve_field(df, x_raw)
+    y = resolve_field(df, y_raw)
+
+    # If missing, infer from title/dataset
     if x is None or y is None:
-        st.info(f"Chart skipped (missing columns): {title} | x={x_raw}, y={y_raw}")
+        ix, iy = infer_xy_from_title(df, chart_spec)
+        x = x or ix
+        y = y or iy
+
+    if x is None or y is None:
+        st.info(f"Chart skipped (missing columns): {title} | x={x}, y={y}")
         return
 
-    if ctype == "bar":
+    if ctype in ["bar", "stacked_bar"]:
         fig = px.bar(df, x=x, y=y, title=title)
-    elif ctype == "line":
+    elif ctype == "line" or ctype == "pareto":
         fig = px.line(df, x=x, y=y, title=title)
     elif ctype == "scatter":
         fig = px.scatter(df, x=x, y=y, title=title)
-    elif ctype == "stacked_bar":
-        series_raw = chart_spec.get("series")
-        series = resolve_field(df, series_raw) if series_raw else None
-        if series:
-            fig = px.bar(df, x=x, y=y, color=series, title=title)
-        else:
-            fig = px.bar(df, x=x, y=y, title=title)
-    elif ctype == "pareto":
-        fig = px.line(df, x=x, y=y, title=title)
+    elif ctype == "histogram":
+        fig = px.histogram(df, x=x, title=title)
     else:
-        st.info(f"Unknown chart type: {ctype}")
-        return
+        fig = px.bar(df, x=x, y=y, title=title)
 
     st.plotly_chart(fig, use_container_width=True)
 
@@ -249,7 +313,7 @@ if uploaded:
 
         with right:
             st.subheader("Charts")
-            st.caption("Charts automatically pick the right dataset (top risky / exposure scatter / pareto curve).")
+            st.caption("Charts are resilient: supports column-based specs OR array-based x/y from the model.")
 
             for ch in insights.get("charts", []):
                 if isinstance(ch, dict) and ch.get("notes"):
